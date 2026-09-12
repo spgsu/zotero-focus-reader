@@ -1,0 +1,15 @@
+{
+	"manifest_version": 2,
+	"name": "Focus Reader",
+	"version": "0.14.0",
+	"description": "Adds a locked, single-page reading mode to Zotero's PDF reader, to restore print-like spatial pagination.",
+	"author": "spgsu",
+	"applications": {
+		"zotero": {
+			"id": "focus-reader@zoteroreader.local",
+			"update_url": "https://raw.githubusercontent.com/spgsu/zotero-focus-reader/main/update.json",
+			"strict_min_version": "7.0",
+			"strict_max_version": "9.*"
+		}
+	}
+}
