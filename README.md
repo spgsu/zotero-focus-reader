@@ -4,6 +4,10 @@ Reading dense academic PDFs on screen is measurably harder than on paper. This
 is a personal plugin that tries to claw back some of the difference, without
 printing and without buying an e-ink device.
 
+**[⬇ Download the latest release (.xpi)](https://github.com/spgsu/zotero-focus-reader/releases/latest/download/focus-reader.xpi)** — then in Zotero:
+Tools → Plugins → gear icon → Install Plugin From File. Please read the caveats
+below first.
+
 Two mutually exclusive modes, each a button in Zotero's PDF reader toolbar.
 
 **Focus mode** — for the first read.
@@ -43,9 +47,11 @@ This is a personal tool published in case it's useful, not a supported product.
 
 ## Installing
 
-Download `focus-reader.xpi` from Releases (or build it: zip the contents of
-`plugin/` — `manifest.json` and `bootstrap.js` at the zip root, not inside a
-folder — and rename to `.xpi`).
+Download
+[`focus-reader.xpi`](https://github.com/spgsu/zotero-focus-reader/releases/latest/download/focus-reader.xpi)
+from [Releases](https://github.com/spgsu/zotero-focus-reader/releases) (or build
+it: zip the contents of `plugin/` — `manifest.json` and `bootstrap.js` at the
+zip root, not inside a folder — and rename to `.xpi`).
 
 Then in Zotero: **Tools → Plugins → gear icon → Install Plugin From File**. No
 restart, no code signing needed.
