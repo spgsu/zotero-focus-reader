@@ -1,8 +1,8 @@
-# ZoteroReader — Requirements Document
+# ZoteroReader — Problem Statement
 
-## 1. Problem Statement
+## Problem Statement
 
-The user reads dense academic PDFs significantly faster and with better comprehension on
+The users report reading dense academic PDFs significantly faster and with better comprehension on
 paper than on screen. This is a documented phenomenon (the "screen inferiority effect"),
 driven by three separable mechanisms — not by backlighting itself:
 
