@@ -1,5 +1,8 @@
 # Focus Reader (Zotero plugin)
 
+**Single page mode for Zotero's PDF reader** — read one page at a time instead
+of continuous scrolling, and see your annotation comments in the page margin.
+
 Reading dense academic PDFs on screen is measurably harder than on paper. This
 is a personal plugin that tries to claw back some of the difference, without
 printing and without buying an e-ink device.
@@ -11,8 +14,8 @@ below first.
 Two mutually exclusive modes, each a button in Zotero's PDF reader toolbar.
 
 **Focus mode** — for the first read.
-- Locked single-page scrolling (CSS scroll snapping), so scrolling settles on
-  one page rather than drifting between two.
+- Locked single page view: scrolling settles on one page at a time rather than
+  drifting between two, instead of Zotero's continuous scrolling.
 - 2x supersampled rendering for better glyph antialiasing.
 - Backdrop colour matched to the page, since Zotero's theme picker doesn't
   cover the area around the page.
