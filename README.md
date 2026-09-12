@@ -20,9 +20,6 @@ Two mutually exclusive modes, each a button in Zotero's PDF reader toolbar.
   annotation's position in the document. Click to jump.
 - Previous / next annotation navigation.
 
-Review mode is strictly read-only — it never writes annotation data. Editing
-still happens in Zotero's sidebar.
-
 ## Read this before installing
 
 This is a personal tool published in case it's useful, not a supported product.
