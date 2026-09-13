@@ -743,6 +743,22 @@ function pageStride(doc) {
 	return (state && state.stride) || 0;
 }
 
+/*
+ * Where the text actually sits on screen. scrollLeft is what we command, but
+ * it is not evidence that anything moved: it reads back the value we just
+ * assigned whether or not the columns repainted. The content box's own
+ * viewport-relative x is the independent measurement, so every sample records
+ * both and a page turn is only "working" if the two agree.
+ */
+function pageSample(doc, scroller) {
+	let content = doc.getElementById("sdt-content");
+	let rect = content && content.getBoundingClientRect();
+	return `sl=${Math.round(scroller.scrollLeft)} `
+		+ `body=${doc.body ? Math.round(doc.body.scrollLeft) : "n/a"} `
+		+ `html=${doc.documentElement ? Math.round(doc.documentElement.scrollLeft) : "n/a"} `
+		+ `rectX=${rect ? Math.round(rect.left) : "n/a"}`;
+}
+
 function turnPage(doc, direction) {
 	let scroller = getScroller(doc);
 	let stride = pageStride(doc);
@@ -755,11 +771,35 @@ function turnPage(doc, direction) {
 	let before = scroller.scrollLeft;
 	let current = Math.round(before / stride);
 	let target = (current + direction) * stride;
+	let beforeSample = pageSample(doc, scroller);
 	scroller.scrollTo({ left: target, behavior: "auto" });
+	let syncSample = pageSample(doc, scroller);
 	Zotero.debug(`Focus Reader: turnPage dir=${direction} `
 		+ `scroller=${scroller.tagName.toLowerCase()} stride=${stride} `
-		+ `before=${before} target=${target} after=${scroller.scrollLeft} `
-		+ `sw=${scroller.scrollWidth} cw=${scroller.clientWidth}`);
+		+ `target=${target} sw=${scroller.scrollWidth} cw=${scroller.clientWidth}\n`
+		+ `  before: ${beforeSample}\n`
+		+ `  sync:   ${syncSample}`);
+
+	/*
+	 * The synchronous read above cannot tell a working page turn from one that
+	 * Reading Mode's own scroll handling immediately undoes -- both report the
+	 * value we just set. Sampling again after a frame, and again once any
+	 * async handler has had time to run, is what separates them: a position
+	 * that reverts to `before` is a fight over the scroll offset, and the
+	 * answer there is to translate the content rather than scroll it.
+	 */
+	let win = doc.defaultView;
+	if (!win) {
+		return;
+	}
+	win.requestAnimationFrame(() => {
+		let raf = pageSample(doc, scroller);
+		win.setTimeout(() => {
+			Zotero.debug(`Focus Reader: turnPage settled dir=${direction}\n`
+				+ `  raf:    ${raf}\n`
+				+ `  +300ms: ${pageSample(doc, scroller)}`);
+		}, 300);
+	});
 }
 
 function enableReadingModePaging(reader, doc) {
@@ -804,7 +844,24 @@ function enableReadingModePaging(reader, doc) {
 		};
 		doc.documentElement.classList.add(PAGED_CLASS);
 
+		/*
+		 * Whether input reaches the Reading Mode document at all is otherwise
+		 * only visible as silence, which is indistinguishable from a page turn
+		 * that fired and did nothing. Announce the first event of each kind so
+		 * absence becomes real evidence instead of an inference.
+		 */
+		let seen = { keydown: false, wheel: false };
+		let noteEvent = (kind, detail) => {
+			if (seen[kind]) {
+				return;
+			}
+			seen[kind] = true;
+			Zotero.debug(`Focus Reader: first ${kind} reached reading-mode doc -- ${detail}`);
+		};
+
 		let onKeyDown = (event) => {
+			noteEvent("keydown", `key=${event.key} target=${event.target
+				&& event.target.nodeName}`);
 			if (event.key === "ArrowRight" || event.key === "PageDown"
 					|| (event.key === " " && !event.shiftKey)) {
 				event.preventDefault();
@@ -820,6 +877,8 @@ function enableReadingModePaging(reader, doc) {
 		// turns rather than leaving it to scroll a now-horizontal document.
 		let wheelCooldown = 0;
 		let onWheel = (event) => {
+			noteEvent("wheel", `deltaY=${event.deltaY} target=${event.target
+				&& event.target.nodeName}`);
 			if (!event.deltaY) {
 				return;
 			}

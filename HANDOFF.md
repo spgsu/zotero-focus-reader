@@ -1,7 +1,7 @@
 # Handoff
 
 State as of 2026-09-13. Environment: Zotero **10.0.2** on Windows 11, plugin
-version **0.17.1** (uncommitted work in progress — see "In progress" below).
+version **0.17.2** (work in progress — see "In progress" below).
 
 ## What this is
 
@@ -50,17 +50,38 @@ but page turns don't move anything.**
 
 ### The open question
 
-With 0.17.1, `turnPage()` logs which element it scrolled plus `scrollLeft`
-before/after. **Get that line first.** It distinguishes:
+**0.17.1's instrumentation could not answer this and was not worth running.**
+It read `scrollLeft` synchronously right after `scrollTo({behavior: "auto"})`,
+and a synchronous read always reports the value just assigned. So a working
+page turn and one that Reading Mode silently undoes logged the *same* line
+(`before=0 target=848 after=848`) — and the second is exactly what the "frozen"
+symptom looks like.
 
-1. handler never fires (wheel/keydown not reaching the SDT document),
-2. `stride` is 0 (sizing calculation wrong),
-3. scroll is applied then immediately undone (Reading Mode's own scroll
-   handling fighting it) — if so, the fix is probably to translate the content
-   with a CSS transform instead of scrolling.
+0.17.2 fixes that. Every turn now logs two records:
 
-0.17.1 also leaves vertical scrolling enabled deliberately, so a failure can no
-longer strand the reader with no way to move.
+```
+Focus Reader: turnPage dir=1 scroller=body stride=848 target=848 sw=22053 cw=906
+  before: sl=0   body=0   html=0 rectX=0
+  sync:   sl=848 body=848 html=0 rectX=-848
+Focus Reader: turnPage settled dir=1
+  raf:    sl=848 body=848 html=0 rectX=-848
+  +300ms: sl=848 body=848 html=0 rectX=-848
+```
+
+`rectX` is `#sdt-content`'s viewport-relative x — an independent measurement of
+whether the text actually moved, since `scrollLeft` only echoes what we set.
+**Run one page turn and read both records.** They separate every candidate:
+
+| Observation | Cause |
+| --- | --- |
+| no `turnPage` line on key, but one on wheel | keydown isn't reaching the SDT document — drive turns from the reader window instead |
+| `turnPage aborted ... stride=0` | sizing; `applyWidth()` measured before layout settled |
+| `sl` moves, `rectX` unchanged | scrolling a box the columns don't paint into — wrong scroller, or columns clipped |
+| `sync` moves, `raf`/`+300ms` revert to `before` | Reading Mode's own scroll handling is fighting us → translate the content with a CSS transform instead of scrolling |
+| all four samples agree and `rectX` shifts by one stride | the page turn works; look at stride/rendering, not scrolling |
+
+Vertical scrolling stays enabled deliberately, so a failure still can't strand
+the reader with no way to move.
 
 ## Hard-won gotchas
 
