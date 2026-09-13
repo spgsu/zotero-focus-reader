@@ -744,62 +744,127 @@ function pageStride(doc) {
 }
 
 /*
- * Where the text actually sits on screen. scrollLeft is what we command, but
- * it is not evidence that anything moved: it reads back the value we just
- * assigned whether or not the columns repainted. The content box's own
- * viewport-relative x is the independent measurement, so every sample records
- * both and a page turn is only "working" if the two agree.
+ * How far the text has actually moved, measured from where it sat when paging
+ * was switched on. scrollLeft is unusable as the source of truth here: the
+ * reading-mode document accepts writes to it and then reports them back while
+ * nothing on screen moves, and a CSS transform moves the text without touching
+ * it at all. The content box's own viewport x is the one measurement that is
+ * true under every mechanism below.
  */
+function pageOffset(doc) {
+	let state = pagingState.get(doc);
+	let content = doc.getElementById("sdt-content");
+	if (!state || !content || state.originX === null) {
+		return 0;
+	}
+	return state.originX - content.getBoundingClientRect().left;
+}
+
 function pageSample(doc, scroller) {
 	let content = doc.getElementById("sdt-content");
 	let rect = content && content.getBoundingClientRect();
 	return `sl=${Math.round(scroller.scrollLeft)} `
-		+ `body=${doc.body ? Math.round(doc.body.scrollLeft) : "n/a"} `
-		+ `html=${doc.documentElement ? Math.round(doc.documentElement.scrollLeft) : "n/a"} `
-		+ `rectX=${rect ? Math.round(rect.left) : "n/a"}`;
+		+ `rectX=${rect ? Math.round(rect.left) : "n/a"} `
+		+ `offset=${Math.round(pageOffset(doc))}`;
+}
+
+/*
+ * Every distinct way of moving the content left, in increasing order of how
+ * much they fight the host. Scrolling is preferred when it works -- it keeps
+ * Reading Mode's own position tracking coherent -- and the transform is the
+ * fallback that cannot be refused, since it bypasses the scroll machinery
+ * entirely. The first one that actually moves the text wins and is remembered,
+ * so the cascade runs once rather than on every page turn.
+ */
+var PAGE_MOVERS = [
+	["scrollTo", (doc, scroller, target) =>
+		scroller.scrollTo({ left: target, behavior: "auto" })],
+	["scrollLeft", (doc, scroller, target) => {
+		scroller.scrollLeft = target;
+	}],
+	["docElement", (doc, scroller, target) => {
+		doc.documentElement.scrollLeft = target;
+	}],
+	["winScroll", (doc, scroller, target) => {
+		doc.defaultView.scrollTo(target, doc.defaultView.scrollY);
+	}],
+	["transform", (doc, scroller, target) => {
+		let content = doc.getElementById("sdt-content");
+		content.style.willChange = "transform";
+		content.style.transform = `translateX(${-target}px)`;
+	}],
+];
+
+function applyMover(doc, scroller, target, mover) {
+	try {
+		mover[1](doc, scroller, target);
+	}
+	catch (e) {
+		Zotero.debug(`Focus Reader: mover ${mover[0]} threw: ${e}`);
+	}
 }
 
 function turnPage(doc, direction) {
 	let scroller = getScroller(doc);
 	let stride = pageStride(doc);
-	if (!scroller || !stride) {
-		Zotero.debug(`Focus Reader: turnPage aborted -- scroller=${!!scroller} stride=${stride}`);
+	let state = pagingState.get(doc);
+	let content = doc.getElementById("sdt-content");
+	if (!scroller || !stride || !state || !content) {
+		Zotero.debug(`Focus Reader: turnPage aborted -- scroller=${!!scroller} `
+			+ `stride=${stride} state=${!!state} content=${!!content}`);
 		return;
 	}
-	// Snap to the nearest page boundary first, so a half-scrolled position
-	// can't accumulate drift across turns.
-	let before = scroller.scrollLeft;
+
+	// Snap to the nearest page boundary first, so a half-turned position can't
+	// accumulate drift across turns.
+	let before = pageOffset(doc);
 	let current = Math.round(before / stride);
-	let target = (current + direction) * stride;
-	let beforeSample = pageSample(doc, scroller);
-	scroller.scrollTo({ left: target, behavior: "auto" });
-	let syncSample = pageSample(doc, scroller);
-	Zotero.debug(`Focus Reader: turnPage dir=${direction} `
-		+ `scroller=${scroller.tagName.toLowerCase()} stride=${stride} `
-		+ `target=${target} sw=${scroller.scrollWidth} cw=${scroller.clientWidth}\n`
-		+ `  before: ${beforeSample}\n`
-		+ `  sync:   ${syncSample}`);
+	let span = Math.max(0, scroller.scrollWidth - scroller.clientWidth);
+	let target = Math.min(Math.max((current + direction) * stride, 0), span);
+	if (Math.abs(target - before) < 1) {
+		return;
+	}
+
+	if (state.mover) {
+		applyMover(doc, scroller, target, state.mover);
+		Zotero.debug(`Focus Reader: turnPage dir=${direction} via=${state.mover[0]} `
+			+ `target=${target} ${pageSample(doc, scroller)}`);
+		return;
+	}
 
 	/*
-	 * The synchronous read above cannot tell a working page turn from one that
-	 * Reading Mode's own scroll handling immediately undoes -- both report the
-	 * value we just set. Sampling again after a frame, and again once any
-	 * async handler has had time to run, is what separates them: a position
-	 * that reverts to `before` is a fight over the scroll offset, and the
-	 * answer there is to translate the content rather than scroll it.
+	 * No mechanism has been proven on this document yet, so try each in turn
+	 * and keep the first whose effect is visible in the content's own position.
+	 * A mechanism that does nothing leaves the document untouched, so the ones
+	 * that fail cost nothing; only the transform leaves a mark, and it is
+	 * cleared again if it turns out not to be needed.
 	 */
-	let win = doc.defaultView;
-	if (!win) {
-		return;
+	let log = [`Focus Reader: turnPage probe dir=${direction} `
+		+ `scroller=${scroller.tagName.toLowerCase()} stride=${stride} `
+		+ `target=${target} sw=${scroller.scrollWidth} cw=${scroller.clientWidth}`,
+		`  start:      ${pageSample(doc, scroller)}`];
+	let winner = null;
+	for (let mover of PAGE_MOVERS) {
+		applyMover(doc, scroller, target, mover);
+		let moved = Math.abs(pageOffset(doc) - before) > 1;
+		log.push(`  ${(mover[0] + ":").padEnd(12)}${pageSample(doc, scroller)}`
+			+ (moved ? "  <-- MOVED" : ""));
+		if (moved) {
+			winner = mover;
+			break;
+		}
+		if (mover[0] === "transform") {
+			content.style.removeProperty("transform");
+			content.style.removeProperty("will-change");
+		}
 	}
-	win.requestAnimationFrame(() => {
-		let raf = pageSample(doc, scroller);
-		win.setTimeout(() => {
-			Zotero.debug(`Focus Reader: turnPage settled dir=${direction}\n`
-				+ `  raf:    ${raf}\n`
-				+ `  +300ms: ${pageSample(doc, scroller)}`);
-		}, 300);
-	});
+	if (winner) {
+		state.mover = winner;
+	}
+	log.push(winner
+		? `  winner=${winner[0]}`
+		: "  nothing moved the content -- every mechanism refused");
+	Zotero.debug(log.join("\n"));
 }
 
 function enableReadingModePaging(reader, doc) {
@@ -892,10 +957,32 @@ function enableReadingModePaging(reader, doc) {
 		};
 		let onResize = () => applyWidth();
 
+		/*
+		 * Something other than us has been seen moving this document's scroll
+		 * offset while our own writes to it were ignored. Whatever manages to
+		 * do that is the mechanism worth copying, so record scrolls we did not
+		 * cause -- capped, because a real scroll fires continuously.
+		 */
+		let scrollsSeen = 0;
+		let onScroll = (event) => {
+			if (scrollsSeen >= 12) {
+				return;
+			}
+			scrollsSeen++;
+			let t = event.target;
+			Zotero.debug(`Focus Reader: scroll #${scrollsSeen} on `
+				+ `${t === doc ? "document" : (t.tagName ? t.tagName.toLowerCase() : String(t))} `
+				+ `${pageSample(doc, getScroller(doc))}`);
+		};
+
 		doc.addEventListener("keydown", onKeyDown, true);
 		doc.addEventListener("wheel", onWheel, { passive: false });
+		doc.addEventListener("scroll", onScroll, true);
 		win.addEventListener("resize", onResize);
-		pagingState.set(doc, { win, onKeyDown, onWheel, onResize, stride: 0 });
+		pagingState.set(doc, {
+			win, onKeyDown, onWheel, onScroll, onResize,
+			stride: 0, originX: null, mover: null,
+		});
 		applyWidth();
 
 		/*
@@ -911,6 +998,17 @@ function enableReadingModePaging(reader, doc) {
 				let scroller = getScroller(doc);
 				let stride = pageStride(doc);
 				let overflow = scroller.scrollWidth - scroller.clientWidth;
+				/*
+				 * Anchor page positions to where the text sits once layout has
+				 * settled, offset by any scroll already in effect, so page one
+				 * is the start of the document rather than wherever the reader
+				 * happened to be when paging was switched on.
+				 */
+				let anchored = pagingState.get(doc);
+				if (anchored) {
+					anchored.originX = content.getBoundingClientRect().left
+						+ scroller.scrollLeft;
+				}
 				let chain = [];
 				for (let el = content; el && el !== doc.documentElement; el = el.parentElement) {
 					let cs = win.getComputedStyle(el);
@@ -949,9 +1047,14 @@ function disableReadingModePaging(doc) {
 		if (content) {
 			content.style.removeProperty("--focus-reader-page-width");
 			content.style.removeProperty("--focus-reader-page-gap");
+			// The transform mover leaves the content displaced; turning paging
+			// off has to put it back or the text stays scrolled off-screen.
+			content.style.removeProperty("transform");
+			content.style.removeProperty("will-change");
 		}
 		doc.removeEventListener("keydown", state.onKeyDown, true);
 		doc.removeEventListener("wheel", state.onWheel);
+		doc.removeEventListener("scroll", state.onScroll, true);
 		state.win.removeEventListener("resize", state.onResize);
 	}
 	catch (e) {

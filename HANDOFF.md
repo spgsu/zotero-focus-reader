@@ -1,7 +1,7 @@
 # Handoff
 
 State as of 2026-09-13. Environment: Zotero **10.0.2** on Windows 11, plugin
-version **0.17.2** (work in progress — see "In progress" below).
+version **0.17.3** (work in progress — see "In progress" below).
 
 ## What this is
 
@@ -48,37 +48,67 @@ but page turns don't move anything.**
 - Reading Mode already has its own line-length control (`data-page-width`:
   narrow/normal/full), so don't build one.
 
+### What the 0.17.2 log settled
+
+**The scroll is never applied at all.** It is not applied-then-undone, so the
+"Reading Mode is fighting us, switch to a transform" theory the previous
+handoff built toward was aimed at the wrong thing.
+
+```
+turnPage dir=1 scroller=body stride=848 target=848 sw=22053 cw=906
+  before: sl=0 rectX=560
+  sync:   sl=0 rectX=560     <- scrollTo({left: 848}) left scrollLeft at 0
+```
+
+Eliminated, each by positive evidence rather than silence:
+
+- **Handlers fire.** `first wheel reached reading-mode doc -- deltaY=6` and
+  `first keydown ... key=ArrowDown target=BODY` both logged.
+- **Sizing is right.** `stride=848`, `sw=22053`, `cw=906`, target well inside
+  the scrollable span. Not a clamp.
+- **Not a snap-back.** `sync`, `raf` and `+300ms` are all identical to
+  `before`. Nothing ever moved to be undone.
+- **`body` really is scrollable.** Later lines show `sl=795` with
+  `rectX=-235` — exactly the 795px shift, so the offset *can* be set and the
+  rect tracks it faithfully. Something other than us moved it.
+
+So the question is no longer "who undoes our scroll" but **why writes to
+`body.scrollLeft` from this plugin are ignored while something else sets the
+same offset successfully.**
+
 ### The open question
 
-**0.17.1's instrumentation could not answer this and was not worth running.**
-It read `scrollLeft` synchronously right after `scrollTo({behavior: "auto"})`,
-and a synchronous read always reports the value just assigned. So a working
-page turn and one that Reading Mode silently undoes logged the *same* line
-(`before=0 target=848 after=848`) — and the second is exactly what the "frozen"
-symptom looks like.
-
-0.17.2 fixes that. Every turn now logs two records:
+0.17.3 answers it by trying every way of moving the content in one page turn
+and reporting which one the document accepts (`PAGE_MOVERS`): `scrollTo`,
+`scrollLeft =`, the same on `documentElement`, `window.scrollTo`, and finally
+a CSS `translateX`, which bypasses the scroll machinery entirely and cannot be
+refused. Each is measured against `#sdt-content`'s own viewport x, so a
+mechanism only counts as working if the text actually moved. The shape of the
+log it emits (**illustration of the format, not a recorded result** -- this
+build has not been run yet):
 
 ```
-Focus Reader: turnPage dir=1 scroller=body stride=848 target=848 sw=22053 cw=906
-  before: sl=0   body=0   html=0 rectX=0
-  sync:   sl=848 body=848 html=0 rectX=-848
-Focus Reader: turnPage settled dir=1
-  raf:    sl=848 body=848 html=0 rectX=-848
-  +300ms: sl=848 body=848 html=0 rectX=-848
+Focus Reader: turnPage probe dir=1 scroller=body stride=848 target=848 ...
+  start:      sl=0   rectX=560  offset=0
+  scrollTo:   sl=0   rectX=560  offset=0
+  scrollLeft: sl=848 rectX=560  offset=0
+  docElement: sl=848 rectX=560  offset=0
+  winScroll:  sl=848 rectX=560  offset=0
+  transform:  sl=848 rectX=-288 offset=848  <-- MOVED
+  winner=transform
 ```
 
-`rectX` is `#sdt-content`'s viewport-relative x — an independent measurement of
-whether the text actually moved, since `scrollLeft` only echoes what we set.
-**Run one page turn and read both records.** They separate every candidate:
+The winner is remembered per document, so the cascade runs once and every
+later turn goes straight to it — the probe is also the fix. Page position is
+now tracked as `originX - rect.left` rather than `scrollLeft`, because that
+measure is true under all five mechanisms.
 
-| Observation | Cause |
-| --- | --- |
-| no `turnPage` line on key, but one on wheel | keydown isn't reaching the SDT document — drive turns from the reader window instead |
-| `turnPage aborted ... stride=0` | sizing; `applyWidth()` measured before layout settled |
-| `sl` moves, `rectX` unchanged | scrolling a box the columns don't paint into — wrong scroller, or columns clipped |
-| `sync` moves, `raf`/`+300ms` revert to `before` | Reading Mode's own scroll handling is fighting us → translate the content with a CSS transform instead of scrolling |
-| all four samples agree and `rectX` shifts by one stride | the page turn works; look at stride/rendering, not scrolling |
+**Turn pages forward (wheel down) to trigger the probe** — a backward turn at
+page one is clamped and returns without probing.
+
+A `scroll` listener also logs up to 12 scrolls it did not cause, to identify
+whatever set that 795 offset; copying its mechanism is the tidier fix if the
+transform turns out to have costs.
 
 Vertical scrolling stays enabled deliberately, so a failure still can't strand
 the reader with no way to move.
