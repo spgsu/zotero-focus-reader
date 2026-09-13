@@ -810,6 +810,32 @@ function applyMover(doc, scroller, target, mover) {
 	}
 }
 
+/*
+ * A page turn should land at the top of the new page. Reading Mode nudges the
+ * document down by a line or two of its own accord -- the lost sentences at the
+ * top of every page -- and it does so partly on a later frame, so the reset has
+ * to be repeated rather than applied once.
+ */
+function resetVertical(doc, scroller, win) {
+	let clear = () => {
+		try {
+			for (let el of [scroller, doc.documentElement, doc.body]) {
+				if (el && el.scrollTop) {
+					el.scrollTop = 0;
+				}
+			}
+		}
+		catch (e) {
+			// A detached document during teardown; nothing to reset.
+		}
+	};
+	clear();
+	if (win) {
+		win.requestAnimationFrame(clear);
+		win.setTimeout(clear, 250);
+	}
+}
+
 function turnPage(doc, direction) {
 	let state = pagingState.get(doc);
 	let stride = pageStride(doc);
@@ -822,33 +848,35 @@ function turnPage(doc, direction) {
 	}
 
 	/*
-	 * The span has to be the one measured at rest. Reading it live breaks
-	 * forward turns: translating the content left clips its overflow rather
-	 * than making it scrollable, so scrollWidth drops by a stride with every
-	 * page turned. The live span meets the advancing target somewhere around
-	 * the middle of the document, clamps it back to where it already is, and
-	 * from there forward turns do nothing while backward turns -- which the
-	 * shrinking span never constrains -- keep working.
+	 * The page number is held, not re-derived from the content's position on
+	 * every turn. Measuring it back each time is what broke forward turns:
+	 * a stale reading made "next" compute a target one or two pages behind
+	 * where the reader already was, so right arrow went nowhere or jumped
+	 * backwards, while left arrow -- moving the same direction as the error --
+	 * kept looking fine. The position is only re-read when someone other than
+	 * us moves the document (see the scroll handler).
 	 */
 	let span = (state.span === null || state.span === undefined)
 		? Math.max(0, scroller.scrollWidth - scroller.clientWidth)
 		: state.span;
-
-	// Snap to the nearest page boundary first, so a half-turned position can't
-	// accumulate drift across turns.
-	let before = pageOffset(doc);
-	let current = Math.round(before / stride);
-	let target = Math.min(Math.max((current + direction) * stride, 0), span);
-	if (Math.abs(target - before) < 1) {
-		Zotero.debug(`Focus Reader: turnPage dir=${direction} at the `
-			+ `${direction > 0 ? "last" : "first"} page -- offset=${Math.round(before)} span=${span}`);
+	let lastPage = Math.max(0, Math.round(span / stride));
+	let from = state.page || 0;
+	let page = Math.min(Math.max(from + direction, 0), lastPage);
+	if (page === from) {
+		Zotero.debug(`Focus Reader: turnPage dir=${direction} already at the `
+			+ `${direction > 0 ? "last" : "first"} page -- ${from} of ${lastPage}`);
 		return;
 	}
+	let target = page * stride;
+	state.page = page;
+	state.lastTurn = Date.now();
 
 	if (state.mover) {
 		applyMover(doc, scroller, target, state.mover);
+		resetVertical(doc, scroller, state.win);
 		Zotero.debug(`Focus Reader: turnPage dir=${direction} via=${state.mover[0]} `
-			+ `target=${target} ${pageSample(doc, scroller)}`);
+			+ `page=${from}->${page} of ${lastPage} target=${target} `
+			+ `${pageSample(doc, scroller)}`);
 		return;
 	}
 
@@ -859,6 +887,7 @@ function turnPage(doc, direction) {
 	 * that fail cost nothing; only the transform leaves a mark, and it is
 	 * cleared again if it turns out not to be needed.
 	 */
+	let before = pageOffset(doc);
 	let log = [`Focus Reader: turnPage probe dir=${direction} `
 		+ `scroller=${scroller.tagName.toLowerCase()} stride=${stride} `
 		+ `target=${target} sw=${scroller.scrollWidth} cw=${scroller.clientWidth}`,
@@ -880,6 +909,11 @@ function turnPage(doc, direction) {
 	}
 	if (winner) {
 		state.mover = winner;
+		resetVertical(doc, scroller, state.win);
+	}
+	else {
+		// Nothing moved, so the page number must not claim otherwise.
+		state.page = from;
 	}
 	log.push(winner
 		? `  winner=${winner[0]}`
@@ -975,6 +1009,9 @@ function enableReadingModePaging(reader, doc) {
 				state.span = span;
 				state.originX = originX;
 				state.scroller = scroller;
+				// The stride just changed, so the held page number refers to a
+				// different place than it did; re-derive it from the document.
+				state.page = Math.max(0, Math.round(scroller.scrollLeft / (columnWidth + gap)));
 			}
 			Zotero.debug(`Focus Reader: page metrics -- column=${columnWidth} gap=${gap} `
 				+ `stride=${columnWidth + gap} viewport=${viewport} `
@@ -1040,6 +1077,24 @@ function enableReadingModePaging(reader, doc) {
 		 */
 		let scrollsSeen = 0;
 		let onScroll = (event) => {
+			/*
+			 * A scroll we did not cause means the reader moved the document
+			 * itself -- a click, a find result, its own position restore. The
+			 * held page number would then be wrong, so re-read it from where
+			 * the document actually is. Our own turns are excluded by time,
+			 * since they scroll too and would otherwise re-derive the very
+			 * number they just set.
+			 */
+			let st = pagingState.get(doc);
+			if (st && st.stride && Date.now() - (st.lastTurn || 0) > 300) {
+				let sl = (st.scroller || getScroller(doc)).scrollLeft;
+				let page = Math.max(0, Math.round(sl / st.stride));
+				if (page !== st.page) {
+					Zotero.debug(`Focus Reader: page resync ${st.page} -> ${page} `
+						+ `after a scroll we did not cause (sl=${Math.round(sl)})`);
+					st.page = page;
+				}
+			}
 			if (scrollsSeen >= 12) {
 				return;
 			}
@@ -1057,6 +1112,7 @@ function enableReadingModePaging(reader, doc) {
 		pagingState.set(doc, {
 			win, onKeyDown, onWheel, onScroll, onResize,
 			stride: 0, originX: null, mover: null, span: null, scroller: null,
+			page: 0, lastTurn: 0,
 		});
 		applyWidth();
 

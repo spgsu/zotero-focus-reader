@@ -1,7 +1,7 @@
 # Handoff
 
 State as of 2026-09-13. Environment: Zotero **10.0.2** on Windows 11, plugin
-version **0.17.4** (work in progress — see "In progress" below).
+version **0.17.5** (work in progress — see "In progress" below).
 
 ## What this is
 
@@ -78,71 +78,79 @@ So the question is no longer "who undoes our scroll" but **why writes to
 `body.scrollLeft` from this plugin are ignored while something else sets the
 same offset successfully.**
 
-### The open question
+### How the mover was found (0.17.3)
 
-0.17.3 answers it by trying every way of moving the content in one page turn
+0.17.3 answered it by trying every way of moving the content in one page turn
 and reporting which one the document accepts (`PAGE_MOVERS`): `scrollTo`,
 `scrollLeft =`, the same on `documentElement`, `window.scrollTo`, and finally
 a CSS `translateX`, which bypasses the scroll machinery entirely and cannot be
 refused. Each is measured against `#sdt-content`'s own viewport x, so a
-mechanism only counts as working if the text actually moved. The shape of the
-log it emits (**illustration of the format, not a recorded result** -- this
-build has not been run yet):
+mechanism only counts as working if the text actually moved. What it recorded:
 
 ```
-Focus Reader: turnPage probe dir=1 scroller=body stride=848 target=848 ...
-  start:      sl=0   rectX=560  offset=0
-  scrollTo:   sl=0   rectX=560  offset=0
-  scrollLeft: sl=848 rectX=560  offset=0
-  docElement: sl=848 rectX=560  offset=0
-  winScroll:  sl=848 rectX=560  offset=0
-  transform:  sl=848 rectX=-288 offset=848  <-- MOVED
-  winner=transform
+Focus Reader: turnPage probe dir=1 scroller=body stride=906 target=906 sw=27127 cw=906
+  start:      sl=0   rectX=560   offset=0
+  scrollTo:   sl=0   rectX=560   offset=0
+  scrollLeft: sl=906 rectX=-346  offset=906  <-- MOVED
+  winner=scrollLeft
 ```
 
 The winner is remembered per document, so the cascade runs once and every
-later turn goes straight to it — the probe is also the fix. Page position is
-now tracked as `originX - rect.left` rather than `scrollLeft`, because that
-measure is true under all five mechanisms.
-
-**Turn pages forward (wheel down) to trigger the probe** — a backward turn at
-page one is clamped and returns without probing.
-
-A `scroll` listener also logs up to 12 scrolls it did not cause, to identify
-whatever set that 795 offset; copying its mechanism is the tidier fix if the
-transform turns out to have costs.
+later turn goes straight to it — the probe is also the fix. It runs on the
+first forward turn only; a backward turn at page one is clamped and returns
+without probing.
 
 Vertical scrolling stays enabled deliberately, so a failure still can't strand
 the reader with no way to move.
 
-### Geometry bugs the transform exposed (0.17.4)
 
-Once pages actually turned, three separate faults showed up. All three were
-derived from the symptoms and the screenshot rather than guessed:
+### The mover is `scrollLeft`, not the transform
 
-- **Forward turns stalled, backward ones always worked.** `turnPage` clamped
-  the target against a *live* `scrollWidth - clientWidth`. Translating content
-  left clips its overflow instead of making it scrollable, so that span shrank
-  by one stride per page turned. Simulated against the real numbers
-  (stride 848, span 21147): the target meets the shrinking span at page 13,
-  and from there forward turns clamp *backward* — 10176 -> 10971 -> 10176
-  forever, while backward turns are never constrained. The span is now
-  measured once at rest and stored on the paging state.
-- **A sliver of the next column was visible** at the right edge (clearly
-  in the 0.17.3 screenshot). The column was sized to `#sdt-content` (800px)
-  but the visible area is wider (906px+), so a page turn of 848px always left
-  the next column peeking. The gap now absorbs the difference —
-  `gap = max(PAGE_GAP, viewport - columnWidth)` — which makes one stride
-  exactly one screenful and puts the next column just past the right edge.
-- **Several lines lost at the top or bottom of each page.** `height: 100vh`
-  assumed the content starts at the top of the viewport. Anything above it
-  pushes an exactly-viewport-tall column that far below the fold, and
-  `column-fill: auto` then clips those lines from *every* column. The height
-  is now measured (`win.innerHeight - contentTop * 2`, giving the bottom the
-  same margin as the top) and logged as `page metrics`.
+`winner=scrollLeft`. `scrollTo({left})` is ignored on this document -- it
+returns having changed nothing -- but assigning `scrollLeft` directly works.
+Both are plain scroll writes, so the difference is Reading Mode's, not CSS's.
+The transform branch has never been exercised; leave the cascade in place, it
+costs one turn and settles the question on any future document.
 
-All geometry is measured with the transform temporarily cleared, since the
-transform shifts every quantity being read.
+This invalidated an earlier theory, recorded here so it isn't re-derived: the
+transform's clipped overflow was blamed for forward turns failing. That
+mechanism is real but irrelevant, since no transform is applied. `scrollWidth`
+stays at 27127 the whole session.
+
+### Why forward turns failed (0.17.5)
+
+Page position was re-derived from the content's measured rect on every turn
+(`originX - rect.left`). That reading drifts, and a stale one makes "next"
+compute a target relative to where the reader *was*, not where it is. From the
+0.17.4 log:
+
+```
+turnPage dir=-1 target=2718     <- at page 3
+turnPage dir=1  target=1812     <- "forward" moved BACK a page
+```
+
+Every anomaly fits `before` lagging by one or two pages: right arrow appearing
+dead (target equals the current position), and the jump from page 0 to page 2.
+Left arrow looked fine throughout because the error and the movement pointed
+the same way.
+
+The page number is now **held in state and stepped**, never re-measured per
+turn. It is re-read only from a scroll the plugin did not cause -- a click, a
+find result, Reading Mode's own position restore -- with our own turns excluded
+by a 300ms window, since those scroll too and would otherwise re-derive the
+number they just set. `applyWidth` also re-derives it, because a resize changes
+the stride under it.
+
+### Lines lost at the top of each page
+
+Reading Mode nudges the document down a line or two by itself after a turn --
+visible as nine consecutive `scroll on [object HTMLDocument]` events, one per
+frame, which is an animation rather than a layout effect. Each turn now resets
+vertical scroll to the top, repeated on the next frame and again at 250ms,
+because part of that nudge lands later than the turn itself.
+
+The 0.17.4 height fix was still right and stays: `contentTop=61 height=796
+winHeight=918` leaves the column clear of the fold.
 
 ## Hard-won gotchas
 
