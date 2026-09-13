@@ -16,6 +16,12 @@ Two mutually exclusive modes, each a button in Zotero's PDF reader toolbar.
 **Focus mode** — for the first read.
 - Locked single page view: scrolling settles on one page at a time rather than
   drifting between two, instead of Zotero's continuous scrolling.
+- **Pagination for Zotero 10's Reading Mode.** Reading Mode reflows a PDF into
+  clean, resizable text but scrolls continuously, with no page boundaries.
+  Turn Focus on while reading and it paginates: one screenful per page, turned
+  with the arrow keys or the scroll wheel. Zotero's EPUB view has paginated
+  flow already; this brings the same idea to Reading Mode. Reflowed typography
+  *and* real page boundaries is the combination neither offered.
 - 2x supersampled rendering for better glyph antialiasing.
 - Backdrop colour matched to the page, since Zotero's theme picker doesn't
   cover the area around the page.
@@ -35,7 +41,7 @@ This is a personal tool published in case it's useful, not a supported product.
   `_internalReader`, `_primaryView`, `_iframeWindow`, `_item`, `_pages`. None of
   that is public API. Any Zotero release can rename it and break this plugin
   without warning.
-- **Developed against Zotero 9.0.6 on Windows only.** Untested elsewhere.
+- **Developed against Zotero 10.0.2 on Windows only.** Untested elsewhere.
 - **PDF only.** It adds no controls for EPUB or snapshot readers.
 - **The supersampling in Focus mode overrides `devicePixelRatio`** for the
   reader iframe. Zotero's annotation layer reads that same value when
