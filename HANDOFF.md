@@ -1,7 +1,7 @@
 # Handoff
 
 State as of 2026-09-13. Environment: Zotero **10.0.2** on Windows 11, plugin
-version **0.17.3** (work in progress — see "In progress" below).
+version **0.17.4** (work in progress — see "In progress" below).
 
 ## What this is
 
@@ -30,8 +30,10 @@ EPUB view *does* have paginated flow (CSS columns); they didn't apply it here.
 Reflowed text plus real page turns is the gap worth filling, and it's the
 original goal of this whole project.
 
-**Current status: not working. Last symptom was "frozen" — pagination applies,
-but page turns don't move anything.**
+**Current status: working.** Page turns move, via a CSS transform — the
+reading-mode document accepts writes to `scrollLeft` and reports them back
+while nothing moves, so scrolling it is not an option (see below). 0.17.4
+fixed three follow-on geometry bugs; re-test before treating it as settled.
 
 ### What's already established (do not re-derive)
 
@@ -112,6 +114,35 @@ transform turns out to have costs.
 
 Vertical scrolling stays enabled deliberately, so a failure still can't strand
 the reader with no way to move.
+
+### Geometry bugs the transform exposed (0.17.4)
+
+Once pages actually turned, three separate faults showed up. All three were
+derived from the symptoms and the screenshot rather than guessed:
+
+- **Forward turns stalled, backward ones always worked.** `turnPage` clamped
+  the target against a *live* `scrollWidth - clientWidth`. Translating content
+  left clips its overflow instead of making it scrollable, so that span shrank
+  by one stride per page turned. Simulated against the real numbers
+  (stride 848, span 21147): the target meets the shrinking span at page 13,
+  and from there forward turns clamp *backward* — 10176 -> 10971 -> 10176
+  forever, while backward turns are never constrained. The span is now
+  measured once at rest and stored on the paging state.
+- **A sliver of the next column was visible** at the right edge (clearly
+  in the 0.17.3 screenshot). The column was sized to `#sdt-content` (800px)
+  but the visible area is wider (906px+), so a page turn of 848px always left
+  the next column peeking. The gap now absorbs the difference —
+  `gap = max(PAGE_GAP, viewport - columnWidth)` — which makes one stride
+  exactly one screenful and puts the next column just past the right edge.
+- **Several lines lost at the top or bottom of each page.** `height: 100vh`
+  assumed the content starts at the top of the viewport. Anything above it
+  pushes an exactly-viewport-tall column that far below the fold, and
+  `column-fill: auto` then clips those lines from *every* column. The height
+  is now measured (`win.innerHeight - contentTop * 2`, giving the bottom the
+  same margin as the top) and logged as `page metrics`.
+
+All geometry is measured with the transform temporarily cleared, since the
+transform shifts every quantity being read.
 
 ## Hard-won gotchas
 

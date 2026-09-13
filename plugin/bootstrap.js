@@ -649,9 +649,15 @@ var SDT_CSS = `
 		overflow-x: auto;
 		overscroll-behavior-x: contain;
 	}
+	/*
+	 * The height is measured and set from JS rather than left at 100vh.
+	 * Anything above the content -- body margin, Reading Mode's own chrome --
+	 * pushes a full-viewport-tall column that far below the fold, and with
+	 * column-fill: auto that clips the last lines of every page.
+	 */
 	html.${PAGED_CLASS} #sdt-content {
 		box-sizing: border-box;
-		height: 100vh;
+		height: var(--focus-reader-page-height, 100vh);
 		column-width: var(--focus-reader-page-width, 40em);
 		column-gap: var(--focus-reader-page-gap, ${PAGE_GAP}px);
 		column-fill: auto;
@@ -805,23 +811,37 @@ function applyMover(doc, scroller, target, mover) {
 }
 
 function turnPage(doc, direction) {
-	let scroller = getScroller(doc);
-	let stride = pageStride(doc);
 	let state = pagingState.get(doc);
+	let stride = pageStride(doc);
 	let content = doc.getElementById("sdt-content");
+	let scroller = (state && state.scroller) || getScroller(doc);
 	if (!scroller || !stride || !state || !content) {
 		Zotero.debug(`Focus Reader: turnPage aborted -- scroller=${!!scroller} `
 			+ `stride=${stride} state=${!!state} content=${!!content}`);
 		return;
 	}
 
+	/*
+	 * The span has to be the one measured at rest. Reading it live breaks
+	 * forward turns: translating the content left clips its overflow rather
+	 * than making it scrollable, so scrollWidth drops by a stride with every
+	 * page turned. The live span meets the advancing target somewhere around
+	 * the middle of the document, clamps it back to where it already is, and
+	 * from there forward turns do nothing while backward turns -- which the
+	 * shrinking span never constrains -- keep working.
+	 */
+	let span = (state.span === null || state.span === undefined)
+		? Math.max(0, scroller.scrollWidth - scroller.clientWidth)
+		: state.span;
+
 	// Snap to the nearest page boundary first, so a half-turned position can't
 	// accumulate drift across turns.
 	let before = pageOffset(doc);
 	let current = Math.round(before / stride);
-	let span = Math.max(0, scroller.scrollWidth - scroller.clientWidth);
 	let target = Math.min(Math.max((current + direction) * stride, 0), span);
 	if (Math.abs(target - before) < 1) {
+		Zotero.debug(`Focus Reader: turnPage dir=${direction} at the `
+			+ `${direction > 0 ? "last" : "first"} page -- offset=${Math.round(before)} span=${span}`);
 		return;
 	}
 
@@ -891,21 +911,76 @@ function enableReadingModePaging(reader, doc) {
 		 * padding, so using it makes the used column width differ from the
 		 * value we set, and the page stride drifts a little further out of
 		 * step with every turn.
+		 *
+		 * Everything here is measured with the transform cleared. The transform
+		 * is what moves pages, and it shifts every geometry this function reads
+		 * -- including the scrollable span, which shrinks by one stride per page
+		 * turned, since overflow to the left of the origin is clipped rather
+		 * than scrollable.
 		 */
+		let scroller = null;
 		let applyWidth = () => {
+			let state = pagingState.get(doc);
+			scroller = scroller || getScroller(doc);
+			let held = content.style.transform;
+			if (held) {
+				content.style.removeProperty("transform");
+			}
+
 			let cs = win.getComputedStyle(content);
 			let padding = (parseFloat(cs.paddingLeft) || 0) + (parseFloat(cs.paddingRight) || 0);
 			let columnWidth = content.clientWidth - padding;
-			if (columnWidth > 0) {
-				content.style.setProperty("--focus-reader-page-width", columnWidth + "px");
-				content.style.setProperty("--focus-reader-page-gap", PAGE_GAP + "px");
-				let state = pagingState.get(doc);
-				if (state) {
-					state.stride = columnWidth + PAGE_GAP;
+			if (columnWidth <= 0) {
+				if (held) {
+					content.style.transform = held;
 				}
-				return columnWidth + PAGE_GAP;
+				return 0;
 			}
-			return 0;
+
+			/*
+			 * The gap absorbs whatever the visible area has spare beyond one
+			 * column, so the next column begins past the right edge instead of
+			 * showing as a sliver -- and one stride becomes exactly one
+			 * screenful, which is what a page turn ought to move.
+			 */
+			let viewport = scroller.clientWidth || win.innerWidth;
+			let gap = Math.max(PAGE_GAP, viewport - columnWidth);
+
+			/*
+			 * Measure how far down the content actually starts and give the
+			 * bottom the same margin, rather than assuming it begins at the top
+			 * of the viewport. Assuming 100vh is what pushed the final lines of
+			 * every column below the fold.
+			 */
+			content.style.removeProperty("height");
+			let scrollTop = (doc.documentElement.scrollTop || 0)
+				+ (doc.body ? doc.body.scrollTop : 0);
+			let top = Math.max(0, Math.round(content.getBoundingClientRect().top + scrollTop));
+			let height = Math.max(240, win.innerHeight - top * 2);
+
+			content.style.setProperty("--focus-reader-page-width", columnWidth + "px");
+			content.style.setProperty("--focus-reader-page-gap", gap + "px");
+			content.style.setProperty("--focus-reader-page-height", height + "px");
+
+			// Read the span only now, with the new column metrics in effect and
+			// the transform still off, so it describes the whole document.
+			let span = Math.max(0, scroller.scrollWidth - scroller.clientWidth);
+			let originX = content.getBoundingClientRect().left + scroller.scrollLeft;
+
+			if (held) {
+				content.style.transform = held;
+			}
+			if (state) {
+				state.stride = columnWidth + gap;
+				state.span = span;
+				state.originX = originX;
+				state.scroller = scroller;
+			}
+			Zotero.debug(`Focus Reader: page metrics -- column=${columnWidth} gap=${gap} `
+				+ `stride=${columnWidth + gap} viewport=${viewport} `
+				+ `contentTop=${top} height=${height} winHeight=${win.innerHeight} `
+				+ `span=${span} pages=${Math.round(span / (columnWidth + gap)) + 1}`);
+			return columnWidth + gap;
 		};
 		doc.documentElement.classList.add(PAGED_CLASS);
 
@@ -981,7 +1056,7 @@ function enableReadingModePaging(reader, doc) {
 		win.addEventListener("resize", onResize);
 		pagingState.set(doc, {
 			win, onKeyDown, onWheel, onScroll, onResize,
-			stride: 0, originX: null, mover: null,
+			stride: 0, originX: null, mover: null, span: null, scroller: null,
 		});
 		applyWidth();
 
@@ -995,20 +1070,15 @@ function enableReadingModePaging(reader, doc) {
 		 */
 		win.requestAnimationFrame(() => {
 			try {
+				/*
+				 * Re-measure now that layout has settled. The first pass runs
+				 * against metrics Reading Mode may not have finished applying,
+				 * and every page position is anchored to what it records.
+				 */
+				applyWidth();
 				let scroller = getScroller(doc);
 				let stride = pageStride(doc);
 				let overflow = scroller.scrollWidth - scroller.clientWidth;
-				/*
-				 * Anchor page positions to where the text sits once layout has
-				 * settled, offset by any scroll already in effect, so page one
-				 * is the start of the document rather than wherever the reader
-				 * happened to be when paging was switched on.
-				 */
-				let anchored = pagingState.get(doc);
-				if (anchored) {
-					anchored.originX = content.getBoundingClientRect().left
-						+ scroller.scrollLeft;
-				}
 				let chain = [];
 				for (let el = content; el && el !== doc.documentElement; el = el.parentElement) {
 					let cs = win.getComputedStyle(el);
@@ -1047,6 +1117,8 @@ function disableReadingModePaging(doc) {
 		if (content) {
 			content.style.removeProperty("--focus-reader-page-width");
 			content.style.removeProperty("--focus-reader-page-gap");
+			content.style.removeProperty("--focus-reader-page-height");
+			content.style.removeProperty("height");
 			// The transform mover leaves the content displaced; turning paging
 			// off has to put it back or the text stays scrolled off-screen.
 			content.style.removeProperty("transform");
