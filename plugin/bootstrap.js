@@ -8,6 +8,10 @@ var REVIEW_CLASS = "focus-reader-review";
 var COMMENTS_ID = "focus-reader-comments";
 var MARKERS_ID = "focus-reader-markers";
 
+var PAGED_CLASS = "focus-reader-paged";
+var SDT_STYLE_ID = "focus-reader-sdt-style";
+var PAGE_GAP = 48;
+
 var SUPERSAMPLE_FACTOR = 2;
 var BALLOON_MIN_WIDTH = 140;
 var BALLOON_MAX_WIDTH = 320;
@@ -619,6 +623,284 @@ function forceRerender(pdfViewer) {
 	}
 }
 
+// -------------------------------------------------------- reading mode paging
+
+/*
+ * Zotero 10's Reading Mode (SDTView) reflows the document into clean HTML, but
+ * scrolls continuously -- which throws away the page boundaries that make print
+ * easier to hold your place in. Their EPUB view does have paginated flow, built
+ * on CSS columns; this applies the same idea to Reading Mode, which they left
+ * scroll-only.
+ *
+ * Columns are the right primitive because the browser breaks between lines, so
+ * pages never slice a line in half the way a fixed-height scroll snap would.
+ * Columns can't be CSS scroll-snap targets, though, so page turns are driven
+ * from JS by scrolling exactly one column stride.
+ */
+var SDT_CSS = `
+	/*
+	 * Vertical scrolling is deliberately left enabled. Columns shouldn't
+	 * produce vertical overflow anyway, and disabling it means any failure of
+	 * the horizontal page turns leaves the reader with no way to move at all.
+	 */
+	html.${PAGED_CLASS}, html.${PAGED_CLASS} body {
+		height: 100%;
+		max-height: 100%;
+		overflow-x: auto;
+		overscroll-behavior-x: contain;
+	}
+	html.${PAGED_CLASS} #sdt-content {
+		box-sizing: border-box;
+		height: 100vh;
+		column-width: var(--focus-reader-page-width, 40em);
+		column-gap: var(--focus-reader-page-gap, ${PAGE_GAP}px);
+		column-fill: auto;
+	}
+`;
+
+/*
+ * Reading Mode runs as its own view alongside the PDF one rather than
+ * replacing it: _primaryView stays the pdf.js view even while you're reading
+ * reflowed text, and the reflowed document lives on _primarySDTView. Whether
+ * it's currently showing is _state.primaryReadingModeEnabled.
+ */
+function getReadingModeDocument(reader) {
+	try {
+		let ir = reader._internalReader;
+		if (!ir) {
+			return null;
+		}
+		let state = ir._state || {};
+		for (let view of [ir._primarySDTView, ir._secondarySDTView]) {
+			if (!view) {
+				continue;
+			}
+			let doc = view._iframeDocument
+				|| (view._iframeWindow && view._iframeWindow.document);
+			if (doc && doc.getElementById("sdt-content")) {
+				return doc;
+			}
+		}
+		Zotero.debug("Focus Reader: no reading-mode document -- "
+			+ `sdtView=${!!ir._primarySDTView} `
+			+ `enabled=${state.primaryReadingModeEnabled} `
+			+ `loading=${state.readingModeLoading}`);
+	}
+	catch (e) {
+		Zotero.debug("Focus Reader: reading-mode lookup failed: " + e);
+	}
+	return null;
+}
+
+/*
+ * Reading Mode may not be the primary view at all -- Zotero describes it as an
+ * overlay, so it could be a separate view instance or a nested frame. Report
+ * the reader's actual shape rather than guessing where #sdt-content lives.
+ */
+function probeReadingMode(reader) {
+	try {
+		let ir = reader._internalReader;
+		let primary = ir && ir._primaryView;
+		let doc = getViewerDocument(reader);
+		let viewKeys = ir
+			? Object.keys(ir).filter(k => /sdt|read|view|mode/i.test(k)).join("|")
+			: "n/a";
+		let stateKeys = (ir && ir._state)
+			? Object.keys(ir._state).filter(k => /sdt|read|mode/i.test(k)).join("|")
+			: "n/a";
+		let frames = doc ? doc.querySelectorAll("iframe").length : -1;
+		let sdtHere = !!(doc && doc.getElementById("sdt-content"));
+		Zotero.debug("Focus Reader: reading-mode probe -- "
+			+ `primaryView=${primary && primary.constructor && primary.constructor.name} `
+			+ `docURL=${doc && doc.location && doc.location.href} `
+			+ `sdtInPrimaryDoc=${sdtHere} iframesInDoc=${frames} `
+			+ `internalKeys=[${viewKeys}] stateKeys=[${stateKeys}]`);
+	}
+	catch (e) {
+		Zotero.debug("Focus Reader: reading-mode probe failed: " + e);
+	}
+}
+
+var pagingState = new WeakMap();
+
+/*
+ * Whichever element actually carries the horizontal overflow. Giving body an
+ * explicit overflow-x makes it its own scroll container, so document.
+ * scrollingElement (<html>) reports nothing to scroll and page turns silently
+ * do nothing.
+ */
+function getScroller(doc) {
+	for (let el of [doc.body, doc.documentElement]) {
+		if (el && el.scrollWidth - el.clientWidth > 1) {
+			return el;
+		}
+	}
+	return doc.scrollingElement || doc.body;
+}
+
+function pageStride(doc) {
+	let state = pagingState.get(doc);
+	return (state && state.stride) || 0;
+}
+
+function turnPage(doc, direction) {
+	let scroller = getScroller(doc);
+	let stride = pageStride(doc);
+	if (!scroller || !stride) {
+		Zotero.debug(`Focus Reader: turnPage aborted -- scroller=${!!scroller} stride=${stride}`);
+		return;
+	}
+	// Snap to the nearest page boundary first, so a half-scrolled position
+	// can't accumulate drift across turns.
+	let before = scroller.scrollLeft;
+	let current = Math.round(before / stride);
+	let target = (current + direction) * stride;
+	scroller.scrollTo({ left: target, behavior: "auto" });
+	Zotero.debug(`Focus Reader: turnPage dir=${direction} `
+		+ `scroller=${scroller.tagName.toLowerCase()} stride=${stride} `
+		+ `before=${before} target=${target} after=${scroller.scrollLeft} `
+		+ `sw=${scroller.scrollWidth} cw=${scroller.clientWidth}`);
+}
+
+function enableReadingModePaging(reader, doc) {
+	if (pagingState.has(doc)) {
+		return;
+	}
+	try {
+		let win = doc.defaultView;
+		let content = doc.getElementById("sdt-content");
+		if (!win || !content) {
+			return;
+		}
+
+		if (!doc.getElementById(SDT_STYLE_ID)) {
+			let style = doc.createElement("style");
+			style.id = SDT_STYLE_ID;
+			style.textContent = SDT_CSS;
+			doc.head.appendChild(style);
+		}
+
+		/*
+		 * One column per page, sized to the content box rather than the
+		 * element's clientWidth -- clientWidth includes Reading Mode's own
+		 * padding, so using it makes the used column width differ from the
+		 * value we set, and the page stride drifts a little further out of
+		 * step with every turn.
+		 */
+		let applyWidth = () => {
+			let cs = win.getComputedStyle(content);
+			let padding = (parseFloat(cs.paddingLeft) || 0) + (parseFloat(cs.paddingRight) || 0);
+			let columnWidth = content.clientWidth - padding;
+			if (columnWidth > 0) {
+				content.style.setProperty("--focus-reader-page-width", columnWidth + "px");
+				content.style.setProperty("--focus-reader-page-gap", PAGE_GAP + "px");
+				let state = pagingState.get(doc);
+				if (state) {
+					state.stride = columnWidth + PAGE_GAP;
+				}
+				return columnWidth + PAGE_GAP;
+			}
+			return 0;
+		};
+		doc.documentElement.classList.add(PAGED_CLASS);
+
+		let onKeyDown = (event) => {
+			if (event.key === "ArrowRight" || event.key === "PageDown"
+					|| (event.key === " " && !event.shiftKey)) {
+				event.preventDefault();
+				turnPage(doc, 1);
+			}
+			else if (event.key === "ArrowLeft" || event.key === "PageUp"
+					|| (event.key === " " && event.shiftKey)) {
+				event.preventDefault();
+				turnPage(doc, -1);
+			}
+		};
+		// A vertical wheel gesture is what people reach for, so map it to page
+		// turns rather than leaving it to scroll a now-horizontal document.
+		let wheelCooldown = 0;
+		let onWheel = (event) => {
+			if (!event.deltaY) {
+				return;
+			}
+			event.preventDefault();
+			let now = Date.now();
+			if (now < wheelCooldown) {
+				return;
+			}
+			wheelCooldown = now + 220;
+			turnPage(doc, event.deltaY > 0 ? 1 : -1);
+		};
+		let onResize = () => applyWidth();
+
+		doc.addEventListener("keydown", onKeyDown, true);
+		doc.addEventListener("wheel", onWheel, { passive: false });
+		win.addEventListener("resize", onResize);
+		pagingState.set(doc, { win, onKeyDown, onWheel, onResize, stride: 0 });
+		applyWidth();
+
+		/*
+		 * Columns only paginate if some ancestor actually scrolls horizontally.
+		 * If nothing does, the extra columns are clipped instead: one screenful
+		 * of text, vertical scrolling disabled, and page turns that can't move
+		 * -- i.e. a frozen reader. Check for real overflow once layout settles
+		 * and back out cleanly if it isn't there, rather than stranding the
+		 * user in a broken view.
+		 */
+		win.requestAnimationFrame(() => {
+			try {
+				let scroller = getScroller(doc);
+				let stride = pageStride(doc);
+				let overflow = scroller.scrollWidth - scroller.clientWidth;
+				let chain = [];
+				for (let el = content; el && el !== doc.documentElement; el = el.parentElement) {
+					let cs = win.getComputedStyle(el);
+					chain.push(`${el.tagName.toLowerCase()}`
+						+ `${el.id ? "#" + el.id : ""}`
+						+ `${el.className && typeof el.className === "string" ? "." + el.className.trim().split(/\s+/).join(".") : ""}`
+						+ `[ox=${cs.overflowX},oy=${cs.overflowY},w=${el.clientWidth},sw=${el.scrollWidth}]`);
+				}
+				Zotero.debug(`Focus Reader: reading-mode paging -- stride=${stride} `
+				+ `scrollerTag=${scroller.tagName.toLowerCase()} `
+					+ `contentWidth=${content.clientWidth} scrollerOverflow=${overflow} `
+					+ `chain=${chain.join(" < ")}`);
+				if (overflow < stride / 2) {
+					Zotero.debug("Focus Reader: pagination produced no scrollable overflow -- reverting");
+					disableReadingModePaging(doc);
+				}
+			}
+			catch (e) {
+				Zotero.debug("Focus Reader: pagination verification failed: " + e);
+			}
+		});
+	}
+	catch (e) {
+		Zotero.debug("Focus Reader: failed to enable reading-mode paging: " + e);
+	}
+}
+
+function disableReadingModePaging(doc) {
+	let state = doc && pagingState.get(doc);
+	if (!state) {
+		return;
+	}
+	try {
+		doc.documentElement.classList.remove(PAGED_CLASS);
+		let content = doc.getElementById("sdt-content");
+		if (content) {
+			content.style.removeProperty("--focus-reader-page-width");
+			content.style.removeProperty("--focus-reader-page-gap");
+		}
+		doc.removeEventListener("keydown", state.onKeyDown, true);
+		doc.removeEventListener("wheel", state.onWheel);
+		state.win.removeEventListener("resize", state.onResize);
+	}
+	catch (e) {
+		Zotero.debug("Focus Reader: failed to disable reading-mode paging: " + e);
+	}
+	pagingState.delete(doc);
+}
+
 // ------------------------------------------------------------------ mode swap
 
 var refreshState = new WeakMap();
@@ -688,6 +970,7 @@ function setMode(reader, controls, mode) {
 	ensureStyles(doc);
 	let win = getViewerWindow(reader);
 	let pdfViewer = getPdfViewer(reader);
+	let readingDoc = getReadingModeDocument(reader);
 	let classes = doc.documentElement.classList;
 
 	// Always tear both modes down first, so switching between them can't leave
@@ -697,15 +980,27 @@ function setMode(reader, controls, mode) {
 	clearReviewOverlays(doc);
 	detachReviewRefresh(pdfViewer);
 	clearBackdropColor(doc);
+	disableReadingModePaging(readingDoc);
 	if (win) {
 		clearSupersampling(win);
 	}
 
 	if (mode === "focus") {
-		classes.add(LOCKED_CLASS);
-		syncBackdropColor(doc);
-		if (win) {
-			setSupersampling(win, SUPERSAMPLE_FACTOR);
+		if (!readingDoc) {
+			probeReadingMode(reader);
+		}
+		Zotero.debug("Focus Reader: focus path -> " + (readingDoc ? "reading mode" : "pdf view"));
+		if (readingDoc) {
+			// Reading Mode is a reflowed HTML view, so none of the pdf.js work
+			// applies -- it gets column pagination instead.
+			enableReadingModePaging(reader, readingDoc);
+		}
+		else {
+			classes.add(LOCKED_CLASS);
+			syncBackdropColor(doc);
+			if (win) {
+				setSupersampling(win, SUPERSAMPLE_FACTOR);
+			}
 		}
 	}
 	else if (mode === "review") {
@@ -717,12 +1012,24 @@ function setMode(reader, controls, mode) {
 	if (mode === "review" && win) {
 		win.setTimeout(() => renderReview(reader, doc), 600);
 	}
-	updateControls(controls, doc);
+	updateControls(controls, reader);
 	Zotero.debug(`Focus Reader: mode -> ${mode || "off"}`);
 }
 
-function updateControls(controls, doc) {
-	let mode = currentMode(doc);
+/*
+ * Focus mode in Reading Mode marks a different document than the PDF path
+ * does, so the active mode has to consider both.
+ */
+function activeMode(reader) {
+	let readingDoc = getReadingModeDocument(reader);
+	if (readingDoc && pagingState.has(readingDoc)) {
+		return "focus";
+	}
+	return currentMode(getViewerDocument(reader));
+}
+
+function updateControls(controls, reader) {
+	let mode = activeMode(reader);
 	controls.focus.setAttribute("aria-pressed", String(mode === "focus"));
 	controls.review.setAttribute("aria-pressed", String(mode === "review"));
 	controls.prev.hidden = mode !== "review";
@@ -766,10 +1073,10 @@ function onRenderToolbar(event) {
 	};
 
 	controls.focus.addEventListener("click", () => {
-		setMode(reader, controls, currentMode(getViewerDocument(reader)) === "focus" ? null : "focus");
+		setMode(reader, controls, activeMode(reader) === "focus" ? null : "focus");
 	});
 	controls.review.addEventListener("click", () => {
-		setMode(reader, controls, currentMode(getViewerDocument(reader)) === "review" ? null : "review");
+		setMode(reader, controls, activeMode(reader) === "review" ? null : "review");
 	});
 	controls.prev.addEventListener("click", () => {
 		stepAnnotation(reader, getViewerDocument(reader), -1);
@@ -778,7 +1085,7 @@ function onRenderToolbar(event) {
 		stepAnnotation(reader, getViewerDocument(reader), 1);
 	});
 
-	updateControls(controls, viewerDoc);
+	updateControls(controls, reader);
 	// One append call, not four: Zotero's renderToolbar hook only honours a
 	// single append, so the buttons go in together inside one container.
 	let container = doc.createElement("div");

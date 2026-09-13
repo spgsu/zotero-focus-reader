@@ -1,7 +1,7 @@
 {
 	"manifest_version": 2,
 	"name": "Focus Reader",
-	"version": "0.15.2",
+	"version": "0.17.1",
 	"description": "Adds a locked, single-page reading mode to Zotero's PDF reader, to restore print-like spatial pagination.",
 	"author": "spgsu",
 	"applications": {
