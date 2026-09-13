@@ -463,6 +463,9 @@ function navigateTo(reader, annotationID) {
  * current scroll position each time rather than remembered, so scrolling by
  * hand between jumps doesn't leave the cursor stale.
  */
+// Which annotation each reader was last stepped to, keyed by its document.
+var lastVisited = new WeakMap();
+
 function stepAnnotation(reader, doc, direction) {
 	try {
 		let pdfViewer = getPdfViewer(reader);
@@ -474,16 +477,38 @@ function stepAnnotation(reader, doc, direction) {
 		if (!located.length) {
 			return;
 		}
-		let viewTop = containerEl.scrollTop + 4;
-		let target;
-		if (direction > 0) {
-			target = located.find(e => e.top > viewTop) || located[0];
+		/*
+		 * The cursor is the annotation we last jumped to, not the scroll
+		 * position. Navigating doesn't necessarily scroll -- if the target is
+		 * already on screen Zotero just selects it -- so deriving "where am I"
+		 * from scrollTop gets the same answer on every click and stepping
+		 * appears stuck. Scroll position is only the fallback, for when there's
+		 * no cursor yet or you've scrolled well away from it by hand.
+		 */
+		let viewTop = containerEl.scrollTop;
+		let viewHeight = containerEl.clientHeight || 0;
+		let lastID = lastVisited.get(doc);
+		let index = -1;
+
+		if (lastID) {
+			let at = located.findIndex(e => e.annotation.id === lastID);
+			if (at !== -1 && Math.abs(located[at].top - viewTop) <= viewHeight) {
+				index = at + direction;
+			}
 		}
-		else {
-			let earlier = located.filter(e => e.top < viewTop - 8);
-			target = earlier.length ? earlier[earlier.length - 1] : located[located.length - 1];
+		if (index === -1) {
+			index = direction > 0
+				? located.findIndex(e => e.top > viewTop)
+				: located.reduce((last, e, i) => (e.top < viewTop ? i : last), -1);
 		}
-		navigateTo(reader, target.annotation.id);
+
+		// Wrap at both ends.
+		if (index < 0 || index >= located.length) {
+			index = direction > 0 ? 0 : located.length - 1;
+		}
+		let target = located[index].annotation.id;
+		lastVisited.set(doc, target);
+		navigateTo(reader, target);
 	}
 	catch (e) {
 		Zotero.debug("Focus Reader: step annotation failed: " + e);
